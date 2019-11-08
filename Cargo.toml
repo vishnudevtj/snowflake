@@ -1,0 +1,13 @@
+[package]
+name = "snowflake"
+version = "0.1.0"
+authors = ["nemesis"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+regex="1"
+byteorder="1.3.1"
+clap="2.33.0"
+colored="1.8.0"
