@@ -1,7 +1,5 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use regex::bytes::Regex;
-use std::ascii;
-use std::char;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
@@ -11,8 +9,6 @@ use std::io::Cursor;
 use std::io::SeekFrom;
 use std::process;
 
-#[macro_use]
-extern crate clap;
 use clap::{App, Arg, ArgGroup};
 use colored::*;
 
@@ -187,23 +183,23 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         expr: None,
         pattern: None,
         perm: PROT_NONE,
-        search_range: (0, 0),
+        search_range: (0, u64::max_value()),
     };
 
-    config.pid = value_t!(matches, "pid", u32)?;
+    config.pid = parse_int(matches.value_of("pid").unwrap())? as u32;
 
     if matches.is_present("bytes") {
-        config.psize = 8;
-        config.needle = value_t!(matches, "bytes", u8)? as u64;
+        config.psize = 1;
+        config.needle = parse_int(matches.value_of("bytes").unwrap())? as u8 as u64;
     } else if matches.is_present("word") {
-        config.psize = 16;
-        config.needle = value_t!(matches, "word", u16)? as u64;
+        config.psize = 2;
+        config.needle = parse_int(matches.value_of("word").unwrap())? as u16 as u64;
     } else if matches.is_present("dword") {
-        config.psize = 32;
-        config.needle = value_t!(matches, "dword", u32)? as u64;
+        config.psize = 4;
+        config.needle = parse_int(matches.value_of("dword").unwrap())? as u32 as u64;
     } else if matches.is_present("qword") {
-        config.psize = 64;
-        config.needle = value_t!(matches, "qword", u64)?;
+        config.psize = 8;
+        config.needle = parse_int(matches.value_of("qword").unwrap())?;
     } else {
         config.psize = 0;
         config.needle = 0;
@@ -212,6 +208,11 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     if matches.is_present("string") {
         config.string = true;
         config.expr = Some(matches.value_of("string").unwrap().to_string());
+    }
+
+
+    if matches.is_present("maps") {
+        config.maps = true;
     }
 
     if matches.is_present("range") {
@@ -227,10 +228,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     if matches.is_present("pattern") {
         config.pattern = Some(matches.value_of("pattern").unwrap().to_string());
     }
-
-    if matches.is_present("maps") {
-        config.maps = true;
-    }
+    
     if matches.is_present("perm") {
         let value = matches.value_of("perm").unwrap();
         if value.contains("x") {
@@ -248,7 +246,9 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
 }
 
 fn parse_int(inp: &str) -> Result<u64, Box<dyn Error>> {
-    let res = inp.parse().unwrap_or(u64::from_str_radix(&inp, 16)?);
+    let res = inp
+        .parse()
+        .unwrap_or(u64::from_str_radix(&inp.trim_start_matches("0x"), 16)?);
     Ok(res)
 }
 
@@ -268,12 +268,12 @@ fn scan_pointer(maps: Maps, buffer: &[u8], size: u64, needle: u64) -> Vec<u64> {
 
     let len = maps.addr.1 - maps.addr.0;
 
-    for i in 0..len / size {
+    for i in 0..(len / size) {
         let value: u64 = match size {
-            8 => rdr.read_u8().unwrap() as u64,
-            16 => rdr.read_u16::<LittleEndian>().unwrap() as u64,
-            32 => rdr.read_u32::<LittleEndian>().unwrap() as u64,
-            64 => rdr.read_u64::<LittleEndian>().unwrap() as u64,
+            1 => rdr.read_u8().unwrap() as u64,
+            2 => rdr.read_u16::<LittleEndian>().unwrap() as u64,
+            4 => rdr.read_u32::<LittleEndian>().unwrap() as u64,
+            8 => rdr.read_u64::<LittleEndian>().unwrap() as u64,
             _ => panic!("invalid pointer size"),
         };
 
@@ -286,13 +286,18 @@ fn scan_pointer(maps: Maps, buffer: &[u8], size: u64, needle: u64) -> Vec<u64> {
 }
 
 fn escape_bytes(buffer: &[u8]) -> String {
-    let mut res = String::new();
-    for bytes in buffer {
-        for i in ascii::escape_default(*bytes) {
-            res.push(char::from_u32(i as u32).unwrap());
+
+    let result = match String::from_utf8(buffer.to_vec()) {
+        Ok(res) => res,
+        Err(_) => {
+            let mut res = String::new();
+            for bytes in buffer {
+                res.push_str(format!("\\x{:02x}",bytes).as_str())
+            }
+            res
         }
-    }
-    return res;
+    };
+    return result;
 }
 
 fn scan_regex(maps: Maps, buffer: &[u8], regex: &str) -> HashMap<u64, String> {
@@ -312,7 +317,7 @@ fn filter_memory(
     memory: Vec<Maps>,
     search_range: (u64, u64),
     perm: u8,
-    pattern: Option<String>,
+    pattern: &Option<String>,
 ) -> Vec<Maps> {
     let mut res: Vec<Maps> = Vec::new();
     let start = search_range.0;
@@ -320,22 +325,26 @@ fn filter_memory(
 
     for i in memory {
         // select maps based on the permission specified
-        if (perm & i.perm) != 0 {
-            res.push(i);
+        if perm != PROT_NONE {
+            if (perm & i.perm) != 0 {
+                res.push(i);
+            }
             continue;
-        }
-        // select maps which are in the correct address range.
-        if i.addr.0 >= start && i.addr.1 <= end {
-            res.push(i);
-            break;
         }
 
         //Select maps according to the path pattern epecified
-        pattern.as_ref().map(|s| {
-            if i.path.contains(s) {
+        if pattern.is_some() {
+            if i.path.contains(pattern.as_ref().unwrap()) {
                 res.push(i);
             }
-        });
+            continue;
+        }
+
+        // select maps which are in the correct address range.
+        if i.addr.0 >= start && i.addr.1 <= end {
+            res.push(i);
+            continue;
+        }
     }
     res
 }
@@ -344,6 +353,37 @@ fn print_maps(memory: &Vec<Maps>) {
     for i in memory {
         println!("0x{:x}-0x{:x}\t{} {}", i.addr.0, i.addr.1, i.perm, i.path);
     }
+}
+
+fn scan_memory(m: Maps, config: &Config) -> Result<(), Box<dyn Error>> {
+    println!(
+        "{} {:#x}-{:#x}\t {}",
+        "Scanning memory".red(),
+        m.addr.0,
+        m.addr.1,
+        m.path
+    );
+
+    let offset = m.addr.0;
+    let size = m.addr.1 - m.addr.0;
+    let buffer = read_from_mem(config.pid, offset, size as usize)?;
+
+    if config.string {
+        let expr = config.expr.as_ref().unwrap();
+        let res = scan_regex(m, &buffer, &expr);
+        if res.len() > 0 {
+            for (addr, value) in res.iter() {
+                println!("{} {:20} @ {:#x}", "Found".green(), value, addr);
+            }
+        }
+    } else {
+        let res = scan_pointer(m, &buffer, config.psize as u64, config.needle);
+        for i in res {
+            println!("{} : {:#18x} @ {:#18x}", "Found".green(), config.needle, i)
+        }
+    }
+    
+    Ok(())
 }
 
 fn main() {
@@ -359,44 +399,15 @@ fn main() {
 
     if config.maps {
         print_maps(&memory);
+        return;
     }
 
-    let memory = filter_memory(memory, config.search_range, config.perm, config.pattern);
+    let memory = filter_memory(memory, config.search_range, config.perm, &config.pattern);
 
     for m in memory {
-        // Currently Only searching for in stack and Heap
-        // have to implemet maps filter functionality
-        // if m.perm & 1 == 0 {continue;}
-        // if ! m.path.contains("stack") && ! m.path.contains("heap") {continue;}
-
-        println!(
-            "{} {:#x}-{:#x}\t {}",
-            "Scanning memory".red(),
-            m.addr.0,
-            m.addr.1,
-            m.path
-        );
-
-        let offset = m.addr.0;
-        let size = m.addr.1 - m.addr.0;
-        let buffer = read_from_mem(config.pid, offset, size as usize).unwrap_or_else(|err| {
-            eprintln!("read from mem: {}", err);
-            vec![]
-        });
-
-        if config.string {
-            let expr = config.expr.as_ref().unwrap();
-            let res = scan_regex(m, &buffer, &expr);
-            if res.len() > 0 {
-                for (addr, value) in res.iter() {
-                    println!("{} {:20} @ {:#x}", "Found".green(), value, addr);
-                }
-            }
-        } else {
-            let res = scan_pointer(m, &buffer, config.psize as u64, config.needle);
-            for i in res {
-                println!("{} : {:#18x} @ {:#18x}", "Found".green(), config.needle, i)
-            }
-        }
+        match scan_memory(m, &config){
+            Ok(_) => {},
+            Err(err) => eprintln!("{}",err)
+        };
     }
 }
